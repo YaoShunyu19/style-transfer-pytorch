@@ -1,18 +1,18 @@
 import numpy as np
-import matplotlib.pyplot as plt
 import torch
 import torchvision
 from torch import nn
-from PIL import Image
 
 
-def preprocess(img, image_shape):
+def preprocess(img, image_shape, rgb_params):
     """
     对原始图像进行处理，将图像变为可训练的tensor
     :param img: 原始图像
     :param image_shape: 处理之后的图像尺寸
+    :param rgb_params: rgb均值 方差
     :return: 处理之后的图像
     """
+    rgb_mean, rgb_std = rgb_params
     transforms = torchvision.transforms.Compose([
         torchvision.transforms.Resize(image_shape),  # resize
         torchvision.transforms.ToTensor(),  # 转tensor
@@ -20,61 +20,68 @@ def preprocess(img, image_shape):
     return transforms(img).unsqueeze(0)  # 增加一个维度
 
 
-def postprocess(img):
+def postprocess(img, rgb_params):
     """
     将处理完的图像处理回去，将tensor变为图像
     :param img: 处理完的图像
+    :param rgb_params: rgb均值 方差
     :return: 处理回去的图像，PIL Image型对象
     """
+    rgb_mean, rgb_std = rgb_params
     img = img[0].to(rgb_std.device)
     img = torch.clamp(img.permute(1, 2, 0) * rgb_std + rgb_mean, 0, 1)
     return torchvision.transforms.ToPILImage()(img.permute(2, 0, 1))
 
 
-def extract_features(X, content_layers, style_layers):
+def extract_features(net, X, layers):
     """
     提取内容图像和样式图像的特征
+    :param net: 网络结构
     :param X: 内容图像tensor
-    :param content_layers: 内容特征网络层序号
-    :param style_layers: 样式特征网络层序号
-    :return: 内容特征；样式特征
+    :param layers: 特征提取层序号
+    :return: 特征
     """
-    contents = []
-    styles = []
+    features = []
     for i in range(len(net)):
         X = net[i](X)
-        if i in style_layers:
-            styles.append(X)
-        if i in content_layers:
-            contents.append(X)
-    return contents, styles
+        if i in layers:
+            features.append(X)
+    return features
 
 
-def get_contents(image_shape, GPU):
+def get_contents(net, content_img, content_layers, image_shape, GPU, rgb_params):
     """
     对内容图像进行处理
+    :param net: 网络结构
+    :param content_img: 内容图像
+    :param content_layers: 内容特征提取层
     :param image_shape: 图像尺寸
     :param GPU: 是否能用GPU进行训练
-    :return: 内容图像tensor；内容图像的特征
+    :param rgb_params: rgb均值 方差
+    :return: 样式图像tensor；样式图像的特征
     """
-    content_X = preprocess(content_img, image_shape)
+    content_X = preprocess(content_img, image_shape, rgb_params)
     if GPU:
         content_X = content_X.to('cuda')
-    contents_Y, _ = extract_features(content_X, content_layers, style_layers)
+    contents_Y = extract_features(net, content_X, content_layers)
     return content_X, contents_Y
 
 
-def get_styles(image_shape, GPU):
+def get_styles(net, style_img, style_layers, image_shape, GPU, rgb_params):
     """
     对样式图像进行处理
+    :param net: 网络结构
+    :param style_img: 风格图像
+    :param style_layers: 风格特征提取层
     :param image_shape: 图像尺寸
     :param GPU: 是否能用GPU进行训练
+    :param rgb_params: rgb均值 方差
     :return: 样式图像tensor；样式图像的特征
     """
-    style_X = preprocess(style_img, image_shape)
+    style_X = preprocess(style_img, image_shape, rgb_params)
     if GPU:
         style_X = style_X.to('cuda')
-    _, styles_Y = extract_features(style_X, content_layers, style_layers)
+    styles_Y = extract_features(net, style_X, style_layers)
     return style_X, styles_Y
 
 
@@ -85,8 +92,6 @@ def content_loss(Y_hat, Y):
     :param Y: 内容图像
     :return: 内容损失tensor
     """
-    # 我们从动态计算梯度的树中分离目标：
-    # 这是一个规定的值，而不是一个变量。
     return torch.square(Y_hat - Y.detach()).mean()
 
 
@@ -121,17 +126,18 @@ def tv_loss(Y_hat):
                   torch.abs(Y_hat[:, :, :, 1:] - Y_hat[:, :, :, :-1]).mean())
 
 
-def compute_loss(X, contents_Y_hat, styles_Y_hat, contents_Y, styles_Y_gram):
+def compute_loss(X, contents_Y_hat, styles_Y_hat, contents_Y, styles_Y_gram, weights):
     """
     计算总的损失
-    :param X:
-    :param contents_Y_hat: 内容图像特征
+    :param X: 处理之后的内容图像
+    :param contents_Y_hat: 估计出的内容图像特征
     :param styles_Y_hat: 样式图像特征
-    :param contents_Y:
-    :param styles_Y_gram:
+    :param contents_Y: 内容图像特征
+    :param styles_Y_gram: 样式信息
     :return: 各个损失分量和总的损失
     """
     # 分别计算内容损失、样式损失和总变差损失
+    content_weight, style_weight, tv_weight = weights
     contents_l = [content_loss(Y_hat, Y) * content_weight for Y_hat, Y in zip(
         contents_Y_hat, contents_Y)]
     styles_l = [style_loss(Y_hat, Y) * style_weight for Y_hat, Y in zip(
@@ -152,13 +158,13 @@ class SynthesizedImage(nn.Module):
         return self.weight
 
 
-def get_inits(X, GPU, lr, styles_Y):
+def get_inits(X, styles_Y, GPU, lr):
     """
     初始化输出图像的初始解
     :param X: 处理之后的内容图像
+    :param styles_Y: 样式图像的特征
     :param GPU: 是否能用GPU进行训练
     :param lr: 学习率
-    :param styles_Y: 样式图像的特征
     :return: 初始解图像；样式图像的协方差矩阵；优化器
     """
     gen_img = SynthesizedImage(X.shape)
@@ -170,30 +176,27 @@ def get_inits(X, GPU, lr, styles_Y):
     return gen_img(), styles_Y_gram, optim
 
 
-def train(X, contents_Y, styles_Y, GPU, lr, epochs_num, lr_decay_epoch):
+def train(net, X, contents_Y, styles_Y, layers, params):
     """
     训练
+    :param net: 网络结构
     :param X: 内容图像tensor
     :param contents_Y: 内容图像的特征
     :param styles_Y: 样式图像的特征
-    :param GPU: 是否能用GPU进行训练
-    :param lr: 学习率
-    :param epochs_num: epochs总数
-    :param lr_decay_epoch: 每轮学习率衰减epochs数
+    :param layers: (内容提取层，风格提取层)
+    :param params: (GPU，学习率，epochs数，学习率下降epochs数，各种损失的权重)
     :return: 样式迁移之后的图像（需要变换回PIL Image型对象）
     """
-    X, styles_Y_gram, optim = get_inits(X, GPU, lr, styles_Y)
-    # return X
+    GPU, lr, epochs_num, lr_decay_epoch, weights = params
+    content_layers, style_layers = layers
+    X, styles_Y_gram, optim = get_inits(X, styles_Y, GPU, lr)
+
     scheduler = torch.optim.lr_scheduler.StepLR(optim, lr_decay_epoch, 0.8)
     for epoch in range(epochs_num):
         optim.zero_grad()
-        contents_Y_hat, styles_Y_hat = extract_features(X, content_layers, style_layers)
-        contents_l, styles_l, tv_l, l = compute_loss(X, contents_Y_hat, styles_Y_hat, contents_Y, styles_Y_gram)
-
-        contents_loss_list.append(sum(contents_l).item())
-        styles_loss_list.append(sum(styles_l).item())
-        tv_loss_list.append(tv_l.item())
-        loss_list.append(l.item())
+        contents_Y_hat = extract_features(net, X, content_layers)
+        styles_Y_hat = extract_features(net, X, style_layers)
+        contents_l, styles_l, tv_l, l = compute_loss(X, contents_Y_hat, styles_Y_hat, contents_Y, styles_Y_gram, weights=weights)
 
         if epoch % 5 == 0:
             print('epoch: ' + str(epoch) +
@@ -208,42 +211,20 @@ def train(X, contents_Y, styles_Y, GPU, lr, epochs_num, lr_decay_epoch):
     return X
 
 
-def draw_plot():
-    """
-    画epoch-各类损失函数图
-    :return:
-    """
-    plt.plot(np.arange(epochs_num), contents_loss_list, c='r', label='contents')
-    plt.plot(np.arange(epochs_num), styles_loss_list, c='g', label='styles')
-    plt.plot(np.arange(epochs_num), tv_loss_list, c='b', label='tv')
-    plt.plot(np.arange(epochs_num), loss_list, c='k', label='loss')
-    plt.title('loss-epochs')
-    plt.legend()
-    plt.grid()
-    plt.show()
-
-
-if __name__ == '__main__':
+def StyleTransfer(content_img, style_img, save_path, file_name, epochs_num=250):
     GPU = False
     if torch.cuda.is_available():
         GPU = True
 
-    content_img_path = '../img/hit.jpg'
-    style_img_path = '../img/style_星月夜.jpg'
-
-    content_img = Image.open(content_img_path)
-    style_img = Image.open(style_img_path)
-
     content_img_tensor = torch.from_numpy(np.array(content_img))
     image_shape = (content_img_tensor.shape[0], content_img_tensor.shape[1])
 
-    while image_shape[0] * image_shape[1] > 4e5:
+    while image_shape[0] * image_shape[1] > 1e5:
         content_img = content_img.resize((int(0.9 * image_shape[1]), int(0.9 * image_shape[0])))
         content_img_tensor = torch.from_numpy(np.array(content_img))
         image_shape = (content_img_tensor.shape[0], content_img_tensor.shape[1])
 
     style_img = style_img.resize((image_shape[1], image_shape[0]))
-    style_img_tensor = torch.from_numpy(np.array(content_img))
     style_image_shape = (content_img_tensor.shape[0], content_img_tensor.shape[1])
     print('content picture size: ' + str(image_shape))
     print('style picture size: ' + str(style_image_shape))
@@ -252,30 +233,20 @@ if __name__ == '__main__':
     rgb_std = torch.tensor([0.229, 0.224, 0.225])
 
     pretrained_net = torchvision.models.vgg19(pretrained=True)
-    # print(pretrained_net)
-    # exit(0)
+
     style_layers, content_layers = [0, 2, 2, 2, 2, 5, 5, 5, 7, 7, 12, 15, 28, 34], [25]  # 2, 5, 7, 10, 12, 14, 34
     net = nn.Sequential(*[pretrained_net.features[i] for i in range(max(content_layers + style_layers) + 1)])
     if GPU:
         net = net.to('cuda')
 
-    content_weight, style_weight, tv_weight = 1, 1000000, 0
-    epochs_num = 2500
+    content_weight, style_weight, tv_weight = 1, 500, 0
+    weights = content_weight, style_weight, tv_weight
     lr_decay_epoch = 50
     lr = 0.5
 
-    contents_loss_list = []
-    styles_loss_list = []
-    tv_loss_list = []
-    loss_list = []
+    content_X, contents_Y = get_contents(net, content_img, content_layers, image_shape, GPU, rgb_params=(rgb_mean, rgb_std))
+    _, styles_Y = get_styles(net, style_img, style_layers, image_shape, GPU, rgb_params=(rgb_mean, rgb_std))
+    output = train(net, content_X, contents_Y, styles_Y, (content_layers, style_layers), (GPU, lr, epochs_num, lr_decay_epoch, weights))
+    output = postprocess(output, rgb_params=(rgb_mean, rgb_std))
 
-    content_X, contents_Y = get_contents(image_shape, GPU)
-    _, styles_Y = get_styles(image_shape, GPU)
-    output = train(content_X, contents_Y, styles_Y, GPU, lr, epochs_num, lr_decay_epoch)
-    output = postprocess(output)
-    # output = output.resize((500, 400))
-    start1 = content_img_path.rfind('/') + 1
-    end1 = content_img_path.rfind('.')
-    start2 = style_img_path.rfind('_') + 1
-    end2 = style_img_path.rfind('.')
-    output.save('../img/output_' + content_img_path[start1:end1] + '_' + style_img_path[start2:end2] + '.jpg')
+    output.save(save_path + file_name)
